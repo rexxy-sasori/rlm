@@ -452,10 +452,16 @@ class LocalREPL(NonIsolatedEnv):
         """Temporarily change to temp directory for execution."""
         old_cwd = os.getcwd()
         try:
-            os.chdir(self.temp_dir)
+            # Only change to temp dir if it still exists
+            if os.path.isdir(self.temp_dir):
+                os.chdir(self.temp_dir)
             yield
         finally:
-            os.chdir(old_cwd)
+            # Try to return to original directory, fallback to / if needed
+            try:
+                os.chdir(old_cwd)
+            except OSError:
+                os.chdir("/")
 
     def _restore_scaffold(self) -> None:
         """Restore scaffold names after execution so overwrites (e.g. context = 'x') don't persist."""
@@ -526,14 +532,16 @@ class LocalREPL(NonIsolatedEnv):
 
     def cleanup(self):
         """Clean up temp directory and reset state."""
+        # Prevent double cleanup without using locks (to avoid bottlenecks)
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
+
         try:
-            shutil.rmtree(self.temp_dir)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
         except Exception:
             pass
         if hasattr(self, "globals"):
             self.globals.clear()
         if hasattr(self, "locals"):
             self.locals.clear()
-
-    def __del__(self):
-        self.cleanup()

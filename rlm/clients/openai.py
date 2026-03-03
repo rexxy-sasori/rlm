@@ -77,7 +77,20 @@ class OpenAIClient(BaseLM):
             model=model, messages=messages, extra_body=extra_body
         )
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
+
+        # Some models (e.g., Qwen3) output to reasoning_content instead of content
+        if content is None and hasattr(message, "reasoning_content"):
+            content = message.reasoning_content
+
+        if content is None:
+            finish_reason = response.choices[0].finish_reason
+            raise RuntimeError(
+                f"Model returned empty content. Finish reason: {finish_reason}. "
+                f"This may indicate the model failed to generate, was filtered, or timed out."
+            )
+        return content
 
     async def acompletion(
         self, prompt: str | list[dict[str, Any]], model: str | None = None
@@ -101,7 +114,20 @@ class OpenAIClient(BaseLM):
             model=model, messages=messages, extra_body=extra_body
         )
         self._track_cost(response, model)
-        return response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
+
+        # Some models (e.g., Qwen3) output to reasoning_content instead of content
+        if content is None and hasattr(message, "reasoning_content"):
+            content = message.reasoning_content
+
+        if content is None:
+            finish_reason = response.choices[0].finish_reason
+            raise RuntimeError(
+                f"Model returned empty content. Finish reason: {finish_reason}. "
+                f"This may indicate the model failed to generate, was filtered, or timed out."
+            )
+        return content
 
     def _track_cost(self, response: openai.ChatCompletion, model: str):
         self.model_call_counts[model] += 1

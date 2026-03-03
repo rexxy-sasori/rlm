@@ -11,11 +11,14 @@ if TYPE_CHECKING:
     from rlm.environments.base_env import BaseEnv
 
 
-def find_code_blocks(text: str) -> list[str]:
+def find_code_blocks(text: str | None) -> list[str]:
     """
     Find REPL code blocks in text wrapped in triple backticks and return List of content(s).
-    Returns None if no code blocks are found.
+    Returns empty list if no code blocks are found or text is None.
     """
+    if text is None:
+        return []
+
     pattern = r"```repl\s*\n(.*?)\n```"
     results = []
 
@@ -26,7 +29,7 @@ def find_code_blocks(text: str) -> list[str]:
     return results
 
 
-def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | None:
+def find_final_answer(text: str | None, environment: "BaseEnv | None" = None) -> str | None:
     """
     Find FINAL(...) or FINAL_VAR(...) statement in response and return the final answer string.
 
@@ -40,6 +43,9 @@ def find_final_answer(text: str, environment: "BaseEnv | None" = None) -> str | 
     Returns:
         The final answer string, or None if no final answer pattern is found
     """
+    if text is None:
+        return None
+
     # Check for FINAL_VAR pattern first - must be at start of line
     final_var_pattern = r"^\s*FINAL_VAR\((.*?)\)"
     match = re.search(final_var_pattern, text, re.MULTILINE | re.DOTALL)

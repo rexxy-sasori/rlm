@@ -1,0 +1,16 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY rlm /app/rlm
+COPY pyproject.toml /app/pyproject.toml
+COPY README.md /app/README.md
+COPY tests /app/tests
+COPY visualizer /app/visualizer
+COPY examples /app/examples
+
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir datasets==4.5.0
+
+COPY experiments /app/experiments
+ENV PYTHONUNBUFFERED=1

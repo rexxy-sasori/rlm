@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import statistics
 import sys
@@ -46,6 +47,16 @@ from typing import Any
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Configure logging - level can be controlled via LOG_LEVEL env var
+log_level = os.environ.get('LOG_LEVEL', 'INFO').upper()
+logging.basicConfig(
+    level=getattr(logging, log_level, logging.INFO),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+logger.debug(f"Logging initialized at level: {log_level}")
 
 try:
     from datasets import load_dataset
@@ -144,7 +155,7 @@ class LoadTestMetrics:
 class SimpleConsole:
     """Fallback console when rich is not available."""
 
-    def print(self, message: str) -> None:
+    def print(self, message: str = "") -> None:
         # Strip rich formatting tags
         import re
         cleaned = re.sub(r'\[.*?\]', '', message)
@@ -197,6 +208,7 @@ class AsyncParallelManager:
         self.results: list[LoadTestResult] = []
         self._progress: Any = None
         self._task_id: Any = None
+        logger.debug(f"AsyncParallelManager initialized with max_concurrency={max_concurrency}")
 
     async def run_load_test(
         self,
@@ -213,6 +225,7 @@ class AsyncParallelManager:
         Returns:
             LoadTestMetrics with aggregated results
         """
+        logger.info(f"Starting load test with {len(dataset_samples)} samples, concurrency={self.max_concurrency}")
         metrics = LoadTestMetrics()
         metrics.start_time = time.perf_counter()
         self.results = []
@@ -235,6 +248,9 @@ class AsyncParallelManager:
             await self._process_all(dataset_samples, metrics)
 
         metrics.end_time = time.perf_counter()
+        logger.info(f"Load test completed: {metrics.successful_requests}/{metrics.total_requests} successful, "
+                   f"throughput={metrics.throughput:.2f} req/s, "
+                   f"mean_latency={metrics.mean_latency:.2f}s")
         return metrics
 
     async def _process_all(
@@ -243,11 +259,14 @@ class AsyncParallelManager:
         metrics: LoadTestMetrics,
     ) -> None:
         """Process all samples with controlled concurrency."""
+        logger.debug(f"Creating {len(dataset_samples)} tasks for processing")
         tasks = [
             self._process_single(sample, metrics)
             for sample in dataset_samples
         ]
+        logger.debug(f"Gathering {len(tasks)} tasks")
         await asyncio.gather(*tasks)
+        logger.debug("All tasks completed")
 
     async def _process_single(
         self,
@@ -255,9 +274,13 @@ class AsyncParallelManager:
         metrics: LoadTestMetrics,
     ) -> None:
         """Process a single sample with semaphore-controlled concurrency."""
+        sample_id = sample.get("id", "unknown")
+        logger.debug(f"[Sample {sample_id}] Acquiring semaphore (available: {self.semaphore._value})")
         async with self.semaphore:
+            logger.debug(f"[Sample {sample_id}] Semaphore acquired, calling RLM")
             result = await self._call_rlm(sample)
             self.results.append(result)
+            logger.debug(f"[Sample {sample_id}] RLM call completed: success={result.success}, latency={result.latency:.2f}s")
 
             # Update metrics
             metrics.total_requests += 1
@@ -270,6 +293,7 @@ class AsyncParallelManager:
                 metrics.failed_requests += 1
                 if result.error:
                     metrics.errors.append(result.error)
+                    logger.warning(f"[Sample {sample_id}] Error: {result.error}")
 
             # Update progress
             if self._progress is not None:
@@ -283,6 +307,9 @@ class AsyncParallelManager:
         sample_id = sample.get("id", "unknown")
         context = sample.get("context_window_text", "")
         question = sample.get("question", "")
+        context_len = len(context) if isinstance(context, str) else 0
+
+        logger.debug(f"[Sample {sample_id}] Building prompt with context_length={context_len}")
 
         # Build the prompt
         prompt = f"""Context:
@@ -295,10 +322,12 @@ If you need to perform calculations or analysis, use the REPL environment.
 Return your final answer with FINAL_VAR."""
 
         start_time = time.perf_counter()
+        logger.info(f"[Sample {sample_id}] Starting RLM completion call")
 
         try:
             # Run RLM completion in thread pool since RLM is synchronous
             loop = asyncio.get_event_loop()
+            logger.debug(f"[Sample {sample_id}] Submitting to thread executor")
             result = await loop.run_in_executor(
                 None,  # Uses default executor
                 lambda: self.rlm.completion(prompt),
@@ -307,6 +336,8 @@ Return your final answer with FINAL_VAR."""
             end_time = time.perf_counter()
             latency = end_time - start_time
 
+            logger.info(f"[Sample {sample_id}] RLM completion finished in {latency:.2f}s")
+
             # Extract token usage from result
             tokens_input = 0
             tokens_output = 0
@@ -314,6 +345,12 @@ Return your final answer with FINAL_VAR."""
                 for model, usage in result.usage_summary.model_usage_summaries.items():
                     tokens_input += usage.total_input_tokens
                     tokens_output += usage.total_output_tokens
+                    logger.debug(f"[Sample {sample_id}] Model {model}: input={usage.total_input_tokens}, output={usage.total_output_tokens}")
+
+            # Log metadata if available
+            if result.metadata and "iterations" in result.metadata:
+                num_iterations = len(result.metadata.get("iterations", []))
+                logger.debug(f"[Sample {sample_id}] RLM performed {num_iterations} iterations")
 
             return LoadTestResult(
                 sample_id=sample_id,
@@ -328,6 +365,7 @@ Return your final answer with FINAL_VAR."""
         except Exception as e:
             end_time = time.perf_counter()
             latency = end_time - start_time
+            logger.error(f"[Sample {sample_id}] RLM completion failed after {latency:.2f}s: {e}")
 
             return LoadTestResult(
                 sample_id=sample_id,
@@ -416,6 +454,8 @@ def load_oolong_dataset(
     Returns:
         List of dataset samples
     """
+    logger.info(f"Loading Oolong dataset: subset={subset}, split={split}, num_samples={num_samples}")
+
     if console is None:
         console = Console() if use_rich and RICH_AVAILABLE else SimpleConsole()
 
@@ -426,6 +466,7 @@ def load_oolong_dataset(
         console.print(f"  Samples: {num_samples}")
 
     try:
+        logger.debug("Calling load_dataset from HuggingFace")
         dataset = load_dataset(
             "oolongbench/oolong-real",
             subset,
@@ -433,7 +474,9 @@ def load_oolong_dataset(
             streaming=False,
             download_mode="reuse_dataset_if_exists"
         )
+        logger.debug(f"Dataset loaded successfully, converting to list")
     except Exception as e:
+        logger.error(f"Failed to load dataset: {e}")
         console.print(f"[red]Error loading dataset: {e}[/red]" if use_rich else f"Error loading dataset: {e}")
         console.print("[yellow]Make sure you have the datasets library installed:[/yellow]" if use_rich else "Make sure you have the datasets library installed:")
         console.print("  pip install datasets")
@@ -441,8 +484,10 @@ def load_oolong_dataset(
 
     # Convert to list and optionally limit samples
     samples = list(dataset)
+    logger.debug(f"Total samples in dataset: {len(samples)}")
     if num_samples:
         samples = samples[:num_samples]
+        logger.debug(f"Limited to {len(samples)} samples")
 
     console.print(f"[green]Loaded {len(samples)} samples[/green]" if use_rich else f"Loaded {len(samples)} samples")
     return samples
@@ -596,10 +641,19 @@ Examples:
 def main():
     args = parse_args()
 
+    # Set logging level based on verbose flag
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Verbose mode enabled - DEBUG logging active")
+    else:
+        logging.getLogger().setLevel(logging.INFO)
+
     use_rich = not args.no_rich and RICH_AVAILABLE
     console = Console() if use_rich else SimpleConsole()
+    logger.debug(f"Console mode: {'rich' if use_rich else 'simple'}")
 
     # Determine backend configuration
+    logger.debug(f"Configuring backend: base_url={args.base_url}, model={args.model}")
     if args.base_url:
         # Local/OpenAI-compatible deployment
         backend = "openai"
@@ -610,8 +664,12 @@ def main():
         # API key is optional for local deployments
         if args.api_key:
             backend_kwargs["api_key"] = args.api_key
+            logger.debug("Using API key from --api-key argument")
         elif os.environ.get("OPENAI_API_KEY"):
             backend_kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
+            logger.debug("Using API key from OPENAI_API_KEY environment variable")
+        else:
+            logger.debug("No API key provided - assuming local deployment without auth")
         # For local deployments, no API key needed (vLLM, Ollama, etc.)
     else:
         # Use Portkey (cloud) - requires API key
@@ -619,16 +677,19 @@ def main():
         api_key = os.environ.get("PORTKEY_API_KEY")
         if not api_key:
             console.print("[red]Error: PORTKEY_API_KEY not set. Set it or use --base-url for local deployment.[/red]" if use_rich else "Error: PORTKEY_API_KEY not set. Set it or use --base-url for local deployment.")
+            logger.error("PORTKEY_API_KEY not set and no --base-url provided")
             sys.exit(1)
         backend_kwargs = {
             "model_name": args.model,
             "api_key": api_key,
         }
+        logger.debug("Using Portkey backend with API key from environment")
 
     # Configure sub-model (for rlm_query calls) if specified
     other_backends = None
     other_backend_kwargs = None
     if args.sub_model or args.sub_base_url:
+        logger.debug(f"Configuring sub-model: sub_base_url={args.sub_base_url}, sub_model={args.sub_model}")
         # Sub-model uses openai backend if base_url specified, otherwise same as root
         if args.sub_base_url:
             other_backends = ["openai"]
@@ -639,15 +700,21 @@ def main():
             # Add API key for sub-model if specified
             if args.sub_api_key:
                 other_backend_kwargs[0]["api_key"] = args.sub_api_key
+                logger.debug("Using sub-model API key from --sub-api-key argument")
             elif args.api_key:
                 other_backend_kwargs[0]["api_key"] = args.api_key
+                logger.debug("Using sub-model API key from root --api-key argument")
             elif os.environ.get("OPENAI_API_KEY"):
                 other_backend_kwargs[0]["api_key"] = os.environ.get("OPENAI_API_KEY")
+                logger.debug("Using sub-model API key from OPENAI_API_KEY environment variable")
         else:
             # Same backend type as root, different model
             other_backends = [backend]
             other_backend_kwargs = [backend_kwargs.copy()]
             other_backend_kwargs[0]["model_name"] = args.sub_model
+            logger.debug(f"Sub-model using same backend as root with model={args.sub_model}")
+    else:
+        logger.debug("No sub-model configured")
 
     # Print configuration
     console.print("[bold blue]RLM Load Testing with Oolong Dataset[/bold blue]" if use_rich else "RLM Load Testing with Oolong Dataset")
@@ -683,14 +750,14 @@ def main():
     console.print()
 
     # Initialize RLM
-    logger = RLMLogger()
+    rlm_logger = RLMLogger()
     rlm_kwargs: dict[str, Any] = {
         "backend": backend,
         "backend_kwargs": backend_kwargs,
         "environment": "local",
         "max_depth": args.max_depth,
         "max_iterations": args.max_iterations,
-        "logger": logger,
+        "logger": rlm_logger,
         "verbose": args.verbose,
         "compaction": args.compaction,
         "compaction_threshold_pct": args.compaction_threshold_pct,
@@ -700,9 +767,12 @@ def main():
         rlm_kwargs["other_backends"] = other_backends
         rlm_kwargs["other_backend_kwargs"] = other_backend_kwargs
 
+    logger.debug(f"Initializing RLM with kwargs: {rlm_kwargs}")
     rlm = RLM(**rlm_kwargs)
+    logger.info("RLM initialized successfully")
 
     # Create async parallel manager
+    logger.debug(f"Creating AsyncParallelManager with concurrency={args.concurrency}")
     manager = AsyncParallelManager(
         rlm=rlm,
         max_concurrency=args.concurrency,
@@ -711,6 +781,7 @@ def main():
     )
 
     # Run load test
+    logger.info(f"Starting load test: {args.num_samples} samples, {args.concurrency} concurrent")
     console.print(f"[cyan]Starting load test with {args.concurrency} concurrent requests...[/cyan]" if use_rich else f"Starting load test with {args.concurrency} concurrent requests...")
     console.print()
 
@@ -757,11 +828,14 @@ def main():
                             stderr = result_data.get("stderr", "")
                             
                             console.print(f"\n      Code Block {k+1}: {execution_time:.2f}s")
-                            console.print(f"      Code: {code[:500].replace('\n', ' ')}...")
+                            code_preview = code[:500].replace('\n', ' ')
+                            console.print(f"      Code: {code_preview}...")
                             if stdout:
-                                console.print(f"      Stdout: {stdout[:200].replace('\n', ' ')}...")
+                                stdout_preview = stdout[:200].replace('\n', ' ')
+                                console.print(f"      Stdout: {stdout_preview}...")
                             if stderr:
-                                console.print(f"      Stderr: {stderr[:200].replace('\n', ' ')}...")
+                                stderr_preview = stderr[:200].replace('\n', ' ')
+                                console.print(f"      Stderr: {stderr_preview}...")
         else:
             console.print(f"  Error: {result.error}")
 

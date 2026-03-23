@@ -6,6 +6,7 @@ from typing import Any
 from rlm.clients import BaseLM, get_client
 from rlm.core.lm_handler import LMHandler
 from rlm.core.types import (
+    CallTrace,
     ClientBackend,
     CodeBlock,
     EnvironmentType,
@@ -186,13 +187,18 @@ class RLM:
             self.verbose.print_metadata(metadata)
 
     @contextmanager
-    def _spawn_completion_context(self, prompt: str | dict[str, Any]):
+    def _spawn_completion_context(self, prompt: str | dict[str, Any], run_id: str | None = None):
         """
         Spawn an LM handler and environment for a single completion call.
 
         When persistent=True, the environment is reused across calls.
         When persistent=False (default), creates fresh environment each call.
         """
+        import uuid
+
+        # Generate unique session ID for call tracing
+        session_id = f"sess_{uuid.uuid4().hex[:12]}"
+
         # Create client and wrap in handler
         client: BaseLM = get_client(self.backend, self.backend_kwargs)
 
@@ -211,6 +217,9 @@ class RLM:
 
         lm_handler.start()
 
+        # Start session for call tracing
+        lm_handler.start_session(session_id)
+
         # Environment: reuse if persistent, otherwise create fresh
         if self.persistent and self._persistent_env is not None:
             environment = self._persistent_env
@@ -228,6 +237,8 @@ class RLM:
             env_kwargs["lm_handler_address"] = (lm_handler.host, lm_handler.port)
             env_kwargs["context_payload"] = prompt
             env_kwargs["depth"] = self.depth + 1  # Environment depth is RLM depth + 1
+            env_kwargs["session_id"] = session_id  # Pass session ID for call tracing
+            env_kwargs["run_id"] = run_id  # Pass run ID for JSONL trace logging
             # For local environment with max_depth > 1, pass subcall callback for recursive RLM calls
             if self.environment_type == "local" and self.max_depth > 1:
                 env_kwargs["subcall_fn"] = self._subcall
@@ -244,7 +255,7 @@ class RLM:
                 self._persistent_env = environment
 
         try:
-            yield lm_handler, environment
+            yield lm_handler, environment, session_id
         finally:
             lm_handler.stop()
             if not self.persistent and hasattr(environment, "cleanup"):
@@ -269,7 +280,7 @@ class RLM:
         return message_history
 
     def completion(
-        self, prompt: str | dict[str, Any], root_prompt: str | None = None
+        self, prompt: str | dict[str, Any], root_prompt: str | None = None, run_id: str | None = None
     ) -> RLMChatCompletion:
         """
         Recursive Language Model completion call. This is the main entry point for querying an RLM, and
@@ -281,6 +292,7 @@ class RLM:
             prompt: A single string or dictionary of messages to pass as context to the model.
             root_prompt: We allow the RLM's root LM to see a (small) prompt that the user specifies. A common example of this
             is if the user is asking the RLM to answer a question, we can pass the question as the root prompt.
+            run_id: Optional run ID for grouping sessions in JSONL trace logs.
         Returns:
             A final answer as a string.
         """
@@ -293,13 +305,19 @@ class RLM:
         self._best_partial_answer = None
         # If we're at max depth, the RLM is an LM, so we fallback to the regular LM.
         if self.depth >= self.max_depth:
-            return self._fallback_answer(prompt)
+            return self._fallback_answer(prompt, run_id=run_id)
 
         if self.logger:
             self.logger.clear_iterations()
 
-        with self._spawn_completion_context(prompt) as (lm_handler, environment):
+        with self._spawn_completion_context(prompt, run_id=run_id) as (lm_handler, environment, session_id):
+            # Start session logging if logger is configured
+            if self.logger:
+                self.logger.start_session(session_id)
             message_history = self._setup_prompt(prompt)
+
+            # Track call traces per iteration
+            iteration_call_traces: list[list[dict]] = []
 
             compaction_count = 0
             try:
@@ -337,11 +355,19 @@ class RLM:
                         build_user_prompt(root_prompt, i, context_count, history_count)
                     ]
 
+                    # Get call trace before iteration
+                    call_trace_before = lm_handler.get_session_trace(session_id)
+
                     iteration: RLMIteration = self._completion_turn(
                         prompt=current_prompt,
                         lm_handler=lm_handler,
                         environment=environment,
                     )
+
+                    # Get new calls made during this iteration
+                    call_trace_after = lm_handler.get_session_trace(session_id)
+                    new_calls = call_trace_after[len(call_trace_before):]
+                    iteration.call_trace = [CallTrace(**call) for call in new_calls]
 
                     # Check error/budget/token limits after each iteration
                     self._check_iteration_limits(iteration, i, lm_handler)
@@ -380,6 +406,13 @@ class RLM:
                         if self.persistent and isinstance(environment, SupportsPersistence):
                             environment.add_history(message_history)
 
+                        # Get final call trace
+                        final_call_trace = lm_handler.end_session(session_id)
+
+                        # End session logging
+                        if self.logger:
+                            self.logger.end_session(session_id, final_answer, time_end - time_start)
+
                         return RLMChatCompletion(
                             root_model=self.backend_kwargs.get("model_name", "unknown")
                             if self.backend_kwargs
@@ -416,6 +449,13 @@ class RLM:
             # Store message history in persistent environment
             if self.persistent and isinstance(environment, SupportsPersistence):
                 environment.add_history(message_history)
+
+            # Get final call trace
+            final_call_trace = lm_handler.end_session(session_id)
+
+            # End session logging
+            if self.logger:
+                self.logger.end_session(session_id, final_answer, time_end - time_start)
 
             return RLMChatCompletion(
                 root_model=self.backend_kwargs.get("model_name", "unknown")
@@ -634,7 +674,7 @@ class RLM:
 
         return response
 
-    def _fallback_answer(self, message: str | dict[str, Any]) -> str:
+    def _fallback_answer(self, message: str | dict[str, Any], run_id: str | None = None) -> str:
         """
         Fallback behavior if the RLM is actually at max depth, and should be treated as an LM.
         """

@@ -135,12 +135,16 @@ class LocalREPL(NonIsolatedEnv):
         custom_tools: dict[str, Any] | None = None,
         custom_sub_tools: dict[str, Any] | None = None,
         compaction: bool = False,
+        session_id: str | None = None,
+        run_id: str | None = None,
         **kwargs,
     ):
         super().__init__(persistent=persistent, depth=depth, **kwargs)
 
         self.lm_handler_address = lm_handler_address
         self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
+        self.session_id = session_id  # Session ID for call tracing
+        self.run_id = run_id  # Run ID for JSONL trace logging
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
@@ -251,7 +255,16 @@ class LocalREPL(NonIsolatedEnv):
             return "Error: No LM handler configured"
 
         try:
-            request = LMRequest(prompt=prompt, model=model, depth=self.depth)
+            import uuid
+            request = LMRequest(
+                prompt=prompt,
+                model=model,
+                depth=self.depth,
+                session_id=self.session_id,
+                run_id=self.run_id,
+                request_id=str(uuid.uuid4()),
+                call_type="llm_query",
+            )
             response = send_lm_request(self.lm_handler_address, request)
 
             if not response.success:
@@ -277,17 +290,32 @@ class LocalREPL(NonIsolatedEnv):
         if not self.lm_handler_address:
             return ["Error: No LM handler configured"] * len(prompts)
         try:
-            responses = send_lm_request_batched(
-                self.lm_handler_address, prompts, model=model, depth=self.depth
+            import uuid
+            # Create a single request with all prompts for tracing
+            request = LMRequest(
+                prompts=prompts,
+                model=model,
+                depth=self.depth,
+                session_id=self.session_id,
+                run_id=self.run_id,
+                request_id=str(uuid.uuid4()),
+                call_type="llm_query_batched",
             )
+            from rlm.core.comms_utils import socket_request
+            response_data = socket_request(self.lm_handler_address, request.to_dict())
+            from rlm.core.comms_utils import LMResponse
+            response = LMResponse.from_dict(response_data)
+
+            if not response.success:
+                return [f"Error: {response.error}"] * len(prompts)
+
+            if response.chat_completions is None:
+                return ["Error: No completions returned"] * len(prompts)
 
             results = []
-            for response in responses:
-                if not response.success:
-                    results.append(f"Error: {response.error}")
-                else:
-                    self._pending_llm_calls.append(response.chat_completion)
-                    results.append(response.chat_completion.response)
+            for chat_completion in response.chat_completions:
+                self._pending_llm_calls.append(chat_completion)
+                results.append(chat_completion.response)
 
             return results
         except Exception as e:

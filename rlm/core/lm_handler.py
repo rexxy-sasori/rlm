@@ -6,12 +6,14 @@ Uses a multi-threaded socket server. Protocol: 4-byte length prefix + JSON paylo
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from socketserver import StreamRequestHandler, ThreadingTCPServer
-from threading import Thread
+from threading import Lock, Thread
 
 from rlm.clients.base_lm import BaseLM
 from rlm.core.comms_utils import LMRequest, LMResponse, socket_recv, socket_send
 from rlm.core.types import RLMChatCompletion, UsageSummary
+from rlm.logger.trace_logger import JSONLTraceLogger, generate_call_id, get_global_trace_logger
 
 
 class LMRequestHandler(StreamRequestHandler):
@@ -59,56 +61,236 @@ class LMRequestHandler(StreamRequestHandler):
             return False
 
     def _handle_single(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
-        """Handle a single prompt request."""
+        """Handle a single prompt request with call tracing."""
         client = handler.get_client(request.model, request.depth)
 
         start_time = time.perf_counter()
-        content = client.completion(request.prompt)
-        end_time = time.perf_counter()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        trace_logger = get_global_trace_logger()
+        call_id = request.request_id or generate_call_id()
+        prompt_length = len(request.prompt) if isinstance(request.prompt, str) else len(str(request.prompt))
 
-        model_usage = client.get_last_usage()
-        root_model = request.model or client.model_name
-        usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
-        return LMResponse.success_response(
-            chat_completion=RLMChatCompletion(
-                root_model=root_model,
-                prompt=request.prompt,
-                response=content,
-                usage_summary=usage_summary,
-                execution_time=end_time - start_time,
+        try:
+            content = client.completion(request.prompt)
+            end_time = time.perf_counter()
+            duration_ms = int((end_time - start_time) * 1000)
+
+            # Log successful call
+            if trace_logger and request.session_id and request.run_id:
+                model_usage = client.get_last_usage()
+                tokens = {
+                    "prompt": model_usage.total_input_tokens,
+                    "completion": model_usage.total_output_tokens,
+                }
+                trace_logger.log_llm_query(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    call_id=call_id,
+                    model=request.model or client.model_name,
+                    prompt=request.prompt if isinstance(request.prompt, str) else str(request.prompt),
+                    response=content,
+                    depth=request.depth,
+                    prompt_length=prompt_length,
+                    response_length=len(content),
+                    tokens=tokens,
+                    duration_ms=duration_ms,
+                    timestamp=timestamp,
+                    success=True,
+                )
+
+            # Legacy call logging for backward compatibility
+            if request.session_id:
+                call_data = {
+                    "request_id": request.request_id,
+                    "call_type": request.call_type or "llm_query",
+                    "model": request.model or client.model_name,
+                    "depth": request.depth,
+                    "prompt_length": prompt_length,
+                    "timestamp": timestamp,
+                    "duration_ms": duration_ms,
+                }
+                handler.log_call(request.session_id, call_data)
+
+            model_usage = client.get_last_usage()
+            root_model = request.model or client.model_name
+            usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+            return LMResponse.success_response(
+                chat_completion=RLMChatCompletion(
+                    root_model=root_model,
+                    prompt=request.prompt,
+                    response=content,
+                    usage_summary=usage_summary,
+                    execution_time=end_time - start_time,
+                ),
+                request_id=request.request_id,
+                duration_ms=duration_ms,
+                timestamp=timestamp,
             )
-        )
+
+        except Exception as e:
+            end_time = time.perf_counter()
+            duration_ms = int((end_time - start_time) * 1000)
+            error_msg = str(e)
+
+            # Log failed call
+            if trace_logger and request.session_id and request.run_id:
+                trace_logger.log_llm_query(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    call_id=call_id,
+                    model=request.model or client.model_name,
+                    prompt=request.prompt if isinstance(request.prompt, str) else str(request.prompt),
+                    response="",
+                    depth=request.depth,
+                    prompt_length=prompt_length,
+                    response_length=0,
+                    duration_ms=duration_ms,
+                    timestamp=timestamp,
+                    success=False,
+                    error=error_msg,
+                )
+
+            # Legacy call logging for backward compatibility
+            if request.session_id:
+                call_data = {
+                    "request_id": request.request_id,
+                    "call_type": request.call_type or "llm_query",
+                    "model": request.model or client.model_name,
+                    "depth": request.depth,
+                    "prompt_length": prompt_length,
+                    "timestamp": timestamp,
+                    "duration_ms": duration_ms,
+                    "error": error_msg,
+                }
+                handler.log_call(request.session_id, call_data)
+
+            raise
 
     def _handle_batched(self, request: LMRequest, handler: "LMHandler") -> LMResponse:
-        """Handle a batched prompts request using async for concurrency."""
+        """Handle a batched prompts request using async for concurrency with call tracing."""
         client = handler.get_client(request.model, request.depth)
 
         start_time = time.perf_counter()
+        timestamp = datetime.now(timezone.utc).isoformat()
+        trace_logger = get_global_trace_logger()
+        call_id = request.request_id or generate_call_id()
+        prompt_lengths = [
+            len(p) if isinstance(p, str) else len(str(p))
+            for p in request.prompts
+        ]
 
         async def run_all():
             tasks = [client.acompletion(prompt) for prompt in request.prompts]
             return await asyncio.gather(*tasks)
 
-        results = asyncio.run(run_all())
-        end_time = time.perf_counter()
+        try:
+            results = asyncio.run(run_all())
+            end_time = time.perf_counter()
 
-        total_time = end_time - start_time
-        model_usage = client.get_last_usage()
-        root_model = request.model or client.model_name
-        usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+            total_time = end_time - start_time
+            duration_ms = int(total_time * 1000)
+            response_lengths = [len(r) for r in results]
 
-        chat_completions = [
-            RLMChatCompletion(
-                root_model=root_model,
-                prompt=prompt,
-                response=content,
-                usage_summary=usage_summary,
-                execution_time=total_time / len(request.prompts),  # approximate per-prompt time
+            # Log successful batched call
+            if trace_logger and request.session_id and request.run_id:
+                model_usage = client.get_last_usage()
+                tokens = {
+                    "prompt": model_usage.total_input_tokens,
+                    "completion": model_usage.total_output_tokens,
+                }
+                trace_logger.log_llm_query_batched(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    call_id=call_id,
+                    model=request.model or client.model_name,
+                    batch_size=len(request.prompts),
+                    prompts=request.prompts,
+                    responses=results,
+                    depth=request.depth,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=response_lengths,
+                    tokens=tokens,
+                    duration_ms=duration_ms,
+                    timestamp=timestamp,
+                    success=True,
+                )
+
+            # Legacy call logging for backward compatibility
+            if request.session_id:
+                call_data = {
+                    "request_id": request.request_id,
+                    "call_type": request.call_type or "llm_query_batched",
+                    "model": request.model or client.model_name,
+                    "depth": request.depth,
+                    "batch_size": len(request.prompts),
+                    "prompt_lengths": prompt_lengths,
+                    "timestamp": timestamp,
+                    "duration_ms": duration_ms,
+                }
+                handler.log_call(request.session_id, call_data)
+
+            model_usage = client.get_last_usage()
+            root_model = request.model or client.model_name
+            usage_summary = UsageSummary(model_usage_summaries={root_model: model_usage})
+
+            chat_completions = [
+                RLMChatCompletion(
+                    root_model=root_model,
+                    prompt=prompt,
+                    response=content,
+                    usage_summary=usage_summary,
+                    execution_time=total_time / len(request.prompts),  # approximate per-prompt time
+                )
+                for prompt, content in zip(request.prompts, results, strict=True)
+            ]
+
+            return LMResponse.batched_success_response(
+                chat_completions=chat_completions,
+                request_id=request.request_id,
+                duration_ms=duration_ms,
+                timestamp=timestamp,
             )
-            for prompt, content in zip(request.prompts, results, strict=True)
-        ]
 
-        return LMResponse.batched_success_response(chat_completions=chat_completions)
+        except Exception as e:
+            end_time = time.perf_counter()
+            duration_ms = int((end_time - start_time) * 1000)
+            error_msg = str(e)
+
+            # Log failed batched call
+            if trace_logger and request.session_id and request.run_id:
+                trace_logger.log_llm_query_batched(
+                    run_id=request.run_id,
+                    session_id=request.session_id,
+                    call_id=call_id,
+                    model=request.model or client.model_name,
+                    batch_size=len(request.prompts),
+                    prompts=request.prompts,
+                    responses=[],
+                    depth=request.depth,
+                    prompt_lengths=prompt_lengths,
+                    response_lengths=[],
+                    duration_ms=duration_ms,
+                    timestamp=timestamp,
+                    success=False,
+                    error=error_msg,
+                )
+
+            # Legacy call logging for backward compatibility
+            if request.session_id:
+                call_data = {
+                    "request_id": request.request_id,
+                    "call_type": request.call_type or "llm_query_batched",
+                    "model": request.model or client.model_name,
+                    "depth": request.depth,
+                    "batch_size": len(request.prompts),
+                    "prompt_lengths": prompt_lengths,
+                    "timestamp": timestamp,
+                    "duration_ms": duration_ms,
+                    "error": error_msg,
+                }
+                handler.log_call(request.session_id, call_data)
+
+            raise
 
 
 class ThreadingLMServer(ThreadingTCPServer):
@@ -124,6 +306,7 @@ class LMHandler:
 
     Uses a multi-threaded socket server for concurrent requests.
     Protocol: 4-byte big-endian length prefix + JSON payload.
+    Includes call tracing for fine-grained logging of LLM calls.
     """
 
     def __init__(
@@ -141,7 +324,32 @@ class LMHandler:
         self._thread: Thread | None = None
         self._port = port
 
+        # Call tracing: session_id -> list of call data
+        self._session_call_logs: dict[str, list[dict]] = {}
+        self._session_lock = Lock()
+
         self.register_client(client.model_name, client)
+
+    def start_session(self, session_id: str) -> None:
+        """Start a new session for call tracing."""
+        with self._session_lock:
+            self._session_call_logs[session_id] = []
+
+    def log_call(self, session_id: str, call_data: dict) -> None:
+        """Log a call for the given session."""
+        with self._session_lock:
+            if session_id in self._session_call_logs:
+                self._session_call_logs[session_id].append(call_data)
+
+    def end_session(self, session_id: str) -> list[dict]:
+        """End a session and return the call trace."""
+        with self._session_lock:
+            return self._session_call_logs.pop(session_id, [])
+
+    def get_session_trace(self, session_id: str) -> list[dict]:
+        """Get the current call trace for a session without ending it."""
+        with self._session_lock:
+            return list(self._session_call_logs.get(session_id, []))
 
     def register_client(self, model_name: str, client: BaseLM) -> None:
         """Register a client for a specific model name."""

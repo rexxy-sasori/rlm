@@ -23,12 +23,18 @@ class LMRequest:
     """Request message sent to the LM Handler.
 
     Supports both single prompt (prompt field) and batched prompts (prompts field).
+    Includes tracing fields for fine-grained call logging.
     """
 
     prompt: str | dict[str, Any] | None = None
     prompts: list[str | dict[str, Any]] | None = None
     model: str | None = None
     depth: int = 0
+    # Tracing fields for call logging
+    session_id: str | None = None
+    request_id: str | None = None
+    call_type: str | None = None  # "llm_query", "llm_query_batched", "rlm_query", "rlm_query_batched"
+    run_id: str | None = None  # Run ID for grouping sessions in JSONL traces
 
     @property
     def is_batched(self) -> bool:
@@ -45,6 +51,14 @@ class LMRequest:
         if self.model is not None:
             d["model"] = self.model
         d["depth"] = self.depth
+        if self.session_id is not None:
+            d["session_id"] = self.session_id
+        if self.request_id is not None:
+            d["request_id"] = self.request_id
+        if self.call_type is not None:
+            d["call_type"] = self.call_type
+        if self.run_id is not None:
+            d["run_id"] = self.run_id
         return d
 
     @classmethod
@@ -55,6 +69,10 @@ class LMRequest:
             prompts=data.get("prompts"),
             model=data.get("model"),
             depth=data.get("depth", -1),  # TODO: Default should throw an error
+            session_id=data.get("session_id"),
+            request_id=data.get("request_id"),
+            call_type=data.get("call_type"),
+            run_id=data.get("run_id"),
         )
 
 
@@ -63,11 +81,16 @@ class LMResponse:
     """Response message from the LM Handler.
 
     Supports both single response (chat_completion) and batched responses (chat_completions).
+    Includes tracing fields for fine-grained call logging.
     """
 
     error: str | None = None
     chat_completion: RLMChatCompletion | None = None
     chat_completions: list[RLMChatCompletion] | None = None
+    # Tracing fields for call logging
+    request_id: str | None = None
+    duration_ms: int | None = None
+    timestamp: str | None = None  # ISO format timestamp
 
     @property
     def success(self) -> bool:
@@ -81,29 +104,33 @@ class LMResponse:
 
     def to_dict(self) -> dict:
         """Convert to dict, excluding None values."""
+        result = {}
         if self.error is not None:
-            return {
-                "error": self.error,
-                "chat_completion": None,
-                "chat_completions": None,
-            }
-        if self.chat_completions is not None:
-            return {
-                "chat_completions": [c.to_dict() for c in self.chat_completions],
-                "chat_completion": None,
-                "error": None,
-            }
-        if self.chat_completion is not None:
-            return {
-                "chat_completion": self.chat_completion.to_dict(),
-                "chat_completions": None,
-                "error": None,
-            }
-        return {
-            "error": "No chat completion or error provided.",
-            "chat_completion": None,
-            "chat_completions": None,
-        }
+            result["error"] = self.error
+            result["chat_completion"] = None
+            result["chat_completions"] = None
+        elif self.chat_completions is not None:
+            result["chat_completions"] = [c.to_dict() for c in self.chat_completions]
+            result["chat_completion"] = None
+            result["error"] = None
+        elif self.chat_completion is not None:
+            result["chat_completion"] = self.chat_completion.to_dict()
+            result["chat_completions"] = None
+            result["error"] = None
+        else:
+            result["error"] = "No chat completion or error provided."
+            result["chat_completion"] = None
+            result["chat_completions"] = None
+        
+        # Add tracing fields
+        if self.request_id is not None:
+            result["request_id"] = self.request_id
+        if self.duration_ms is not None:
+            result["duration_ms"] = self.duration_ms
+        if self.timestamp is not None:
+            result["timestamp"] = self.timestamp
+        
+        return result
 
     @classmethod
     def from_dict(cls, data: dict) -> "LMResponse":
@@ -120,22 +147,25 @@ class LMResponse:
             error=data.get("error"),
             chat_completion=chat_completion,
             chat_completions=chat_completions,
+            request_id=data.get("request_id"),
+            duration_ms=data.get("duration_ms"),
+            timestamp=data.get("timestamp"),
         )
 
     @classmethod
-    def success_response(cls, chat_completion: RLMChatCompletion) -> "LMResponse":
+    def success_response(cls, chat_completion: RLMChatCompletion, request_id: str | None = None, duration_ms: int | None = None, timestamp: str | None = None) -> "LMResponse":
         """Create a successful single response."""
-        return cls(chat_completion=chat_completion)
+        return cls(chat_completion=chat_completion, request_id=request_id, duration_ms=duration_ms, timestamp=timestamp)
 
     @classmethod
-    def batched_success_response(cls, chat_completions: list[RLMChatCompletion]) -> "LMResponse":
+    def batched_success_response(cls, chat_completions: list[RLMChatCompletion], request_id: str | None = None, duration_ms: int | None = None, timestamp: str | None = None) -> "LMResponse":
         """Create a successful batched response."""
-        return cls(chat_completions=chat_completions)
+        return cls(chat_completions=chat_completions, request_id=request_id, duration_ms=duration_ms, timestamp=timestamp)
 
     @classmethod
-    def error_response(cls, error: str) -> "LMResponse":
+    def error_response(cls, error: str, request_id: str | None = None) -> "LMResponse":
         """Create an error response."""
-        return cls(error=error)
+        return cls(error=error, request_id=request_id)
 
 
 # =============================================================================

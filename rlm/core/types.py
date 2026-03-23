@@ -201,21 +201,86 @@ class CodeBlock:
 
 
 @dataclass
+class CallTrace:
+    """Trace of a single LLM call."""
+
+    request_id: str
+    call_type: str  # "llm_query", "llm_query_batched", "rlm_query", "rlm_query_batched"
+    model: str
+    depth: int
+    timestamp: str
+    duration_ms: int
+    prompt_length: int | None = None
+    batch_size: int | None = None
+    prompt_lengths: list[int] | None = None
+
+    def to_dict(self):
+        result = {
+            "request_id": self.request_id,
+            "call_type": self.call_type,
+            "model": self.model,
+            "depth": self.depth,
+            "timestamp": self.timestamp,
+            "duration_ms": self.duration_ms,
+        }
+        if self.prompt_length is not None:
+            result["prompt_length"] = self.prompt_length
+        if self.batch_size is not None:
+            result["batch_size"] = self.batch_size
+        if self.prompt_lengths is not None:
+            result["prompt_lengths"] = self.prompt_lengths
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CallTrace":
+        return cls(
+            request_id=data["request_id"],
+            call_type=data["call_type"],
+            model=data["model"],
+            depth=data["depth"],
+            timestamp=data["timestamp"],
+            duration_ms=data["duration_ms"],
+            prompt_length=data.get("prompt_length"),
+            batch_size=data.get("batch_size"),
+            prompt_lengths=data.get("prompt_lengths"),
+        )
+
+
+@dataclass
 class RLMIteration:
     prompt: str | dict[str, Any]
     response: str
     code_blocks: list[CodeBlock]
     final_answer: str | None = None
     iteration_time: float | None = None
+    call_trace: list[CallTrace] | None = None  # Fine-grained LLM call tracing
 
     def to_dict(self):
-        return {
+        result = {
             "prompt": self.prompt,
             "response": self.response,
             "code_blocks": [code_block.to_dict() for code_block in self.code_blocks],
             "final_answer": self.final_answer,
             "iteration_time": self.iteration_time,
         }
+        if self.call_trace is not None:
+            result["call_trace"] = [ct.to_dict() for ct in self.call_trace]
+        return result
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RLMIteration":
+        code_blocks = [CodeBlock(cb["code"], REPLResult(**cb["result"])) for cb in data.get("code_blocks", [])]
+        call_trace = None
+        if "call_trace" in data:
+            call_trace = [CallTrace.from_dict(ct) for ct in data["call_trace"]]
+        return cls(
+            prompt=data["prompt"],
+            response=data["response"],
+            code_blocks=code_blocks,
+            final_answer=data.get("final_answer"),
+            iteration_time=data.get("iteration_time"),
+            call_trace=call_trace,
+        )
 
 
 ########################################################

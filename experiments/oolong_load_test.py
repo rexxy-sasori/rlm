@@ -79,6 +79,12 @@ except ImportError:
 
 from rlm import RLM
 from rlm.logger import RLMLogger
+from rlm.logger.trace_logger import (
+    JSONLTraceLogger,
+    generate_run_id,
+    generate_session_id,
+    set_global_trace_logger,
+)
 
 
 @dataclass
@@ -191,6 +197,7 @@ class AsyncParallelManager:
     Manages async parallel execution of RLM calls for load testing.
 
     Uses asyncio.Semaphore to control concurrency level.
+    Supports JSONL trace logging for visualizer compatibility.
     """
 
     def __init__(
@@ -199,6 +206,8 @@ class AsyncParallelManager:
         max_concurrency: int = 5,
         console: Any | None = None,
         use_rich: bool = True,
+        trace_logger: JSONLTraceLogger | None = None,
+        run_id: str | None = None,
     ):
         self.rlm = rlm
         self.max_concurrency = max_concurrency
@@ -208,7 +217,9 @@ class AsyncParallelManager:
         self.results: list[LoadTestResult] = []
         self._progress: Any = None
         self._task_id: Any = None
-        logger.debug(f"AsyncParallelManager initialized with max_concurrency={max_concurrency}")
+        self.trace_logger = trace_logger
+        self.run_id = run_id or generate_run_id()
+        logger.debug(f"AsyncParallelManager initialized with max_concurrency={max_concurrency}, run_id={self.run_id}")
 
     async def run_load_test(
         self,
@@ -275,12 +286,34 @@ class AsyncParallelManager:
     ) -> None:
         """Process a single sample with semaphore-controlled concurrency."""
         sample_id = sample.get("id", "unknown")
+        session_id = generate_session_id()
+
+        # Start session in trace logger
+        if self.trace_logger:
+            self.trace_logger.start_session(self.run_id, session_id)
+            logger.debug(f"[Sample {sample_id}] Started trace session: {session_id}")
+
         logger.debug(f"[Sample {sample_id}] Acquiring semaphore (available: {self.semaphore._value})")
         async with self.semaphore:
             logger.debug(f"[Sample {sample_id}] Semaphore acquired, calling RLM")
-            result = await self._call_rlm(sample)
+            result = await self._call_rlm(sample, session_id)
             self.results.append(result)
             logger.debug(f"[Sample {sample_id}] RLM call completed: success={result.success}, latency={result.latency:.2f}s")
+
+            # End session in trace logger
+            if self.trace_logger:
+                total_calls = 0
+                if result.metadata and "iterations" in result.metadata:
+                    for iteration in result.metadata.get("iterations", []):
+                        call_trace = iteration.get("call_trace", [])
+                        total_calls += len(call_trace)
+                self.trace_logger.end_session(
+                    self.run_id,
+                    session_id,
+                    total_calls=total_calls,
+                    total_duration_ms=int(result.latency * 1000),
+                )
+                logger.debug(f"[Sample {sample_id}] Ended trace session: {session_id}, total_calls={total_calls}")
 
             # Update metrics
             metrics.total_requests += 1
@@ -302,7 +335,7 @@ class AsyncParallelManager:
                 elif hasattr(self._progress, 'advance'):
                     self._progress.advance(self._task_id)
 
-    async def _call_rlm(self, sample: dict[str, Any]) -> LoadTestResult:
+    async def _call_rlm(self, sample: dict[str, Any], session_id: str) -> LoadTestResult:
         """Make a single RLM completion call."""
         sample_id = sample.get("id", "unknown")
         context = sample.get("context_window_text", "")
@@ -330,7 +363,7 @@ Return your final answer with FINAL_VAR."""
             logger.debug(f"[Sample {sample_id}] Submitting to thread executor")
             result = await loop.run_in_executor(
                 None,  # Uses default executor
-                lambda: self.rlm.completion(prompt),
+                lambda: self.rlm.completion(prompt, run_id=self.run_id),
             )
 
             end_time = time.perf_counter()
@@ -749,8 +782,26 @@ def main():
     )
     console.print()
 
-    # Initialize RLM
-    rlm_logger = RLMLogger()
+    # Initialize trace logger for JSONL output
+    trace_log_dir = os.environ.get("RLM_TRACE_LOG_DIR", "/tmp/rlm_traces")
+    trace_logger = JSONLTraceLogger(trace_log_dir)
+    run_id = generate_run_id()
+    set_global_trace_logger(trace_logger)
+    trace_logger.start_run(run_id, model_config={
+        "root_model": args.model,
+        "sub_model": args.sub_model or args.model,
+        "max_depth": args.max_depth,
+        "max_iterations": args.max_iterations,
+    })
+    logger.info(f"Trace logging initialized: run_id={run_id}, log_dir={trace_log_dir}")
+    console.print(f"[cyan]Trace logging enabled: run_id={run_id}[/cyan]" if use_rich else f"Trace logging enabled: run_id={run_id}")
+    console.print(f"[cyan]Trace log directory: {trace_log_dir}[/cyan]" if use_rich else f"Trace log directory: {trace_log_dir}")
+
+    # Initialize RLM with logger that saves to disk for visualizer
+    rlm_log_dir = os.environ.get("RLM_LOG_DIR", "/root/rlm-logs")
+    rlm_logger = RLMLogger(log_dir=rlm_log_dir, session_mode=True)
+    logger.info(f"RLM logger initialized: log_dir={rlm_log_dir}")
+    console.print(f"[cyan]RLM logs directory: {rlm_log_dir}[/cyan]" if use_rich else f"RLM logs directory: {rlm_log_dir}")
     rlm_kwargs: dict[str, Any] = {
         "backend": backend,
         "backend_kwargs": backend_kwargs,
@@ -778,6 +829,8 @@ def main():
         max_concurrency=args.concurrency,
         console=console,
         use_rich=use_rich,
+        trace_logger=trace_logger,
+        run_id=run_id,
     )
 
     # Run load test
@@ -838,6 +891,12 @@ def main():
                                 console.print(f"      Stderr: {stderr_preview}...")
         else:
             console.print(f"  Error: {result.error}")
+
+    # End the trace run
+    if trace_logger:
+        trace_logger.end_run(run_id)
+        logger.info(f"Trace run ended: {run_id}")
+        console.print(f"[cyan]Trace log saved to: {trace_log_dir}/{run_id}.jsonl[/cyan]" if use_rich else f"Trace log saved to: {trace_log_dir}/{run_id}.jsonl")
 
 
 if __name__ == "__main__":
